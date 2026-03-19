@@ -23,6 +23,7 @@ import json
 import os
 import re
 import sys
+import tempfile
 import time
 from pathlib import Path
 
@@ -121,11 +122,19 @@ def collect_files(repo_dir: Path, max_files: int) -> list[tuple[str, str]]:
     return files
 
 
+_SOUNDCHECK_TAG = re.compile(r"<(/?)soundcheck-", re.IGNORECASE)
+
+
+def _sanitize_content(content: str) -> str:
+    """Neutralize soundcheck XML tags in file content to prevent prompt injection."""
+    return _SOUNDCHECK_TAG.sub(r"<\1soundcheck\u2011", content)
+
+
 def build_user_prompt(files: list[tuple[str, str]]) -> str:
     parts = [USER_PROMPT_HEADER]
     for rel_path, content in files:
         ext = Path(rel_path).suffix.lstrip(".")
-        parts.append(f"## {rel_path}\n```{ext}\n{content}\n```\n")
+        parts.append(f"## {rel_path}\n```{ext}\n{_sanitize_content(content)}\n```\n")
     return "\n".join(parts)
 
 
@@ -158,23 +167,48 @@ def parse_findings(response: str) -> list[dict]:
         return []
 
 
-def apply_rewrites(repo_dir: Path, rewrites: dict[str, str]) -> list[str]:
+def apply_rewrites(
+    repo_dir: Path, rewrites: dict[str, str], reviewed: set[str]
+) -> list[str]:
     """
-    Write rewritten content to disk.
-    Skips any path that escapes the repo root (path traversal guard).
+    Write rewritten content to disk using atomic writes.
+    Skips any path that:
+      - escapes the repo root (path traversal guard)
+      - was not in the set of files sent for review (allowlist)
     Returns list of relative paths successfully written.
     """
+    repo_root = repo_dir.resolve()
     written: list[str] = []
     for rel_path, content in rewrites.items():
-        target = (repo_dir / rel_path).resolve()
-        if not target.is_relative_to(repo_dir.resolve()):
-            print(f"  [skip] {rel_path} — path outside repo root", file=sys.stderr)
+        safe_rel = rel_path.replace("\r", "").replace("\n", "")
+        log_rel = safe_rel.replace("\r", "").replace("\n", "")
+        if safe_rel not in reviewed:
+            print(f"  [skip] {log_rel} — not in reviewed file set", file=sys.stderr)
+            continue
+        target = (repo_dir / safe_rel).resolve()
+        if not target.is_relative_to(repo_root):
+            print(f"  [skip] {log_rel} — path outside repo root", file=sys.stderr)
             continue
         target.parent.mkdir(parents=True, exist_ok=True)
-        target.write_text(content, encoding="utf-8")
-        written.append(rel_path)
-        print(f"  [rewrite] {rel_path}")
+        tmp_fd, tmp_path = tempfile.mkstemp(dir=target.parent)
+        try:
+            with os.fdopen(tmp_fd, "w", encoding="utf-8") as fh:
+                fh.write(content)
+            os.replace(tmp_path, target)
+        except Exception:
+            os.unlink(tmp_path)
+            raise
+        written.append(safe_rel)
+        print(f"  [rewrite] {log_rel}")
     return written
+
+
+def _safe_write(path: str, content: str) -> None:
+    """Write content to path, refusing to follow symlinks."""
+    p = Path(path)
+    if p.is_symlink():
+        raise RuntimeError(f"Refusing to write to symlink: {path}")
+    p.write_text(content, encoding="utf-8")
 
 
 def build_pr_body(findings: list[dict], rewritten: list[str], file_count: int) -> str:
@@ -309,6 +343,9 @@ def main() -> int:
                 time.sleep(wait)
             else:
                 raise
+    if not response.content or not hasattr(response.content[0], "text"):
+        print("ERROR: unexpected API response structure", file=sys.stderr)
+        return 1
     response_text = response.content[0].text
 
     findings = parse_findings(response_text)
@@ -320,16 +357,15 @@ def main() -> int:
           f"({len(critical_high)} Critical/High, {len(medium)} Medium) · "
           f"Rewrites: {len(rewrites)}")
 
-    rewritten = apply_rewrites(repo_dir, rewrites)
+    reviewed = {rel for rel, _ in files}
+    rewritten = apply_rewrites(repo_dir, rewrites, reviewed)
 
     summary = build_pr_body(findings, rewritten, len(files))
-    Path(args.output_summary).write_text(summary, encoding="utf-8")
+    _safe_write(args.output_summary, summary)
     print(f"\nPR summary written to {args.output_summary}")
 
     if findings:
-        Path(args.output_findings).write_text(
-            json.dumps(findings, indent=2), encoding="utf-8"
-        )
+        _safe_write(args.output_findings, json.dumps(findings, indent=2))
         print(f"Findings JSON written to {args.output_findings}")
     print("\n" + summary)
 
