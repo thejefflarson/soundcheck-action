@@ -64,6 +64,7 @@ runs:
       env:
         ANTHROPIC_API_KEY: ${{ inputs.anthropic-api-key }}
       run: |
+        set +e
         python "$GITHUB_ACTION_PATH/scripts/security-review-action.py" \
           --repo-dir "$GITHUB_WORKSPACE" \
           --skill-path /tmp/soundcheck/skills/security-review/SKILL.md \

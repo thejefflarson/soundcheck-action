@@ -23,6 +23,7 @@ import json
 import os
 import re
 import sys
+import time
 from pathlib import Path
 
 import anthropic
@@ -260,12 +261,28 @@ def main() -> int:
     print(f"Collected {len(files)} file(s) ({total_kb} KB). Sending to {args.model}...")
 
     client = anthropic.Anthropic(api_key=api_key)
-    response = client.messages.create(
-        model=args.model,
-        max_tokens=8192,
-        system=system_prompt,
-        messages=[{"role": "user", "content": build_user_prompt(files)}],
-    )
+    max_retries = 4
+    for attempt in range(max_retries):
+        try:
+            response = client.messages.create(
+                model=args.model,
+                max_tokens=8192,
+                system=system_prompt,
+                messages=[{"role": "user", "content": build_user_prompt(files)}],
+            )
+            break
+        except anthropic.APIStatusError as exc:
+            if exc.status_code == 429 and attempt < max_retries - 1:
+                retry_after = exc.response.headers.get("retry-after")
+                wait = int(float(retry_after)) if retry_after else 30 * (2 ** attempt)
+                print(f"Rate limited — retrying in {wait}s...", flush=True)
+                time.sleep(wait)
+            elif exc.status_code == 529 and attempt < max_retries - 1:
+                wait = 2 ** attempt
+                print(f"API overloaded — retrying in {wait}s...", flush=True)
+                time.sleep(wait)
+            else:
+                raise
     response_text = response.content[0].text
 
     findings = parse_findings(response_text)
