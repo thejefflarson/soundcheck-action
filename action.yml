@@ -67,7 +67,8 @@ runs:
           --skill-path /tmp/soundcheck/skills/security-review/SKILL.md \
           --max-files "${{ inputs.max-files }}" \
           --model "${{ inputs.model }}" \
-          --output-summary /tmp/soundcheck-summary.md
+          --output-summary /tmp/soundcheck-summary.md \
+          --output-findings /tmp/soundcheck-findings.json
         echo "exit-code=$?" >> "$GITHUB_OUTPUT"
 
         FINDINGS=$(grep -c "^| [🔴🟠🟡🔵]" /tmp/soundcheck-summary.md 2>/dev/null || echo "0")
@@ -183,3 +184,10 @@ runs:
           echo "" >> "$GITHUB_STEP_SUMMARY"
           echo "**PR:** ${{ steps.open-pr.outputs.pr-url }}" >> "$GITHUB_STEP_SUMMARY"
         fi
+
+    - name: Upload findings JSON
+      if: hashFiles('/tmp/soundcheck-findings.json') != ''
+      uses: actions/upload-artifact@v4
+      with:
+        name: soundcheck-findings
+        path: /tmp/soundcheck-findings.json

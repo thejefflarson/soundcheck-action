@@ -234,6 +234,10 @@ def main() -> int:
         help="Write PR body markdown to this path (default: /tmp/soundcheck-summary.md)",
     )
     parser.add_argument(
+        "--output-findings", metavar="PATH", default="/tmp/soundcheck-findings.json",
+        help="Write findings JSON to this path (default: /tmp/soundcheck-findings.json)",
+    )
+    parser.add_argument(
         "--model", default=MODEL,
         help=f"Claude model to use (default: {MODEL})",
     )
@@ -299,6 +303,12 @@ def main() -> int:
     summary = build_pr_body(findings, rewritten, len(files))
     Path(args.output_summary).write_text(summary, encoding="utf-8")
     print(f"\nPR summary written to {args.output_summary}")
+
+    if findings:
+        Path(args.output_findings).write_text(
+            json.dumps(findings, indent=2), encoding="utf-8"
+        )
+        print(f"Findings JSON written to {args.output_findings}")
     print("\n" + summary)
 
     return 1 if critical_high else 0
