@@ -62,6 +62,7 @@ Then output a JSON findings list:
   {
     "severity": "Critical|High|Medium|Low",
     "file": "relative/path/to/file",
+    "line": 42,
     "skill": "skill-name",
     "finding": "one-line description"
   }
@@ -194,7 +195,9 @@ def build_pr_body(findings: list[dict], rewritten: list[str], file_count: int) -
     for severity in ("Critical", "High", "Medium", "Low"):
         for f in by_severity[severity]:
             icon = icons[severity]
-            file_ = f"`{f.get('file', '—')}`" if f.get("file") else "—"
+            file_str = f.get("file", "")
+            line = f.get("line")
+            file_ = f"`{file_str}:{line}`" if file_str and line else (f"`{file_str}`" if file_str else "—")
             skill = f"`{f.get('skill', '—')}`" if f.get("skill") else "—"
             lines.append(
                 f"| {icon} {severity} | {file_} | {skill} | {f.get('finding', '—')} |"
