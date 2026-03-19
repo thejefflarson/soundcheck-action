@@ -53,6 +53,11 @@ runs:
       shell: bash
       run: pip install anthropic
 
+    - name: Download Soundcheck skills
+      shell: bash
+      run: |
+        git clone --depth 1 https://github.com/thejefflarson/soundcheck /tmp/soundcheck
+
     - name: Run security review
       id: review
       shell: bash
@@ -61,7 +66,7 @@ runs:
       run: |
         python "$GITHUB_ACTION_PATH/scripts/security-review-action.py" \
           --repo-dir "$GITHUB_WORKSPACE" \
-          --skill-path "$GITHUB_ACTION_PATH/skills/security-review/SKILL.md" \
+          --skill-path /tmp/soundcheck/skills/security-review/SKILL.md \
           --max-files "${{ inputs.max-files }}" \
           --model "${{ inputs.model }}" \
           --output-summary /tmp/soundcheck-summary.md
