@@ -140,10 +140,10 @@ Review the findings table in the PR description for details."
         BODY="$(cat /tmp/soundcheck-summary.md)"
 
         if [ "${{ github.event_name }}" = "pull_request" ]; then
-          # Update the body of the PR that triggered this run
+          # Comment findings on the PR that triggered this run
           PR_NUMBER="${{ github.event.pull_request.number }}"
-          echo "Updating PR #$PR_NUMBER"
-          gh pr edit "$PR_NUMBER" --body "$BODY"
+          echo "Commenting on PR #$PR_NUMBER"
+          gh pr comment "$PR_NUMBER" --body "$BODY"
           PR_URL=$(gh pr view "$PR_NUMBER" --json url --jq '.url')
         else
           BRANCH="${{ steps.push.outputs.branch }}"
