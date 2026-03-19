@@ -73,6 +73,11 @@ runs:
 
         FINDINGS=$(grep -c "^| [🔴🟠🟡🔵]" /tmp/soundcheck-summary.md 2>/dev/null || echo "0")
         echo "findings-count=$FINDINGS" >> "$GITHUB_OUTPUT"
+        if [ -f /tmp/soundcheck-findings.json ]; then
+          echo "has-findings=true" >> "$GITHUB_OUTPUT"
+        else
+          echo "has-findings=false" >> "$GITHUB_OUTPUT"
+        fi
 
     - name: Check for rewritten files
       id: changes
@@ -186,7 +191,7 @@ runs:
         fi
 
     - name: Upload findings JSON
-      if: hashFiles('/tmp/soundcheck-findings.json') != ''
+      if: steps.review.outputs.has-findings == 'true'
       uses: actions/upload-artifact@v4
       with:
         name: soundcheck-findings
