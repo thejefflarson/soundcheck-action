@@ -1,8 +1,5 @@
 name: Soundcheck Security Review
-description: >
-  Full OWASP security review for your repository. Rewrites Critical, High, and Medium
-  findings in place, then opens a pull request with the changes and a severity-ranked
-  findings table.
+description: "OWASP security review that rewrites Critical/High/Medium findings and opens a PR with a severity-ranked findings table."
 
 branding:
   icon: shield
