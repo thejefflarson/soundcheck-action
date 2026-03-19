@@ -96,68 +96,86 @@ runs:
       env:
         GH_TOKEN: ${{ inputs.github-token }}
       run: |
-        BRANCH="soundcheck/security-review"
         cd "$GITHUB_WORKSPACE"
-
         git config user.name  "soundcheck[bot]"
         git config user.email "soundcheck[bot]@users.noreply.github.com"
 
-        # Stash the staged rewrites, switch to (or create) the review branch, pop them
-        git stash
-        if git ls-remote --exit-code --heads origin "$BRANCH" > /dev/null 2>&1; then
-          git checkout "$BRANCH"
-          git reset --hard "origin/${{ inputs.base-branch }}"
-        else
-          git checkout -b "$BRANCH" "origin/${{ inputs.base-branch }}"
-        fi
-        git stash pop
-
-        git add -A
-        git commit -m "Soundcheck: apply security review fixes
+        if [ "${{ github.event_name }}" = "pull_request" ]; then
+          # Commit fixes directly onto the PR branch
+          BRANCH="${{ github.head_ref }}"
+          git add -A
+          git commit -m "Soundcheck: apply security review fixes
 
 Automated fixes from the Soundcheck security review action.
 Review the findings table in the PR description for details."
+          git push origin "$BRANCH"
+        else
+          # Stash the staged rewrites, switch to (or create) the review branch, pop them
+          BRANCH="soundcheck/security-review"
+          git stash
+          if git ls-remote --exit-code --heads origin "$BRANCH" > /dev/null 2>&1; then
+            git checkout "$BRANCH"
+            git reset --hard "origin/${{ inputs.base-branch }}"
+          else
+            git checkout -b "$BRANCH" "origin/${{ inputs.base-branch }}"
+          fi
+          git stash pop
+          git add -A
+          git commit -m "Soundcheck: apply security review fixes
 
-        git push origin "$BRANCH" --force
+Automated fixes from the Soundcheck security review action.
+Review the findings table in the PR description for details."
+          git push origin "$BRANCH" --force
+        fi
+
         echo "branch=$BRANCH" >> "$GITHUB_OUTPUT"
 
     - name: Open or update pull request
       id: open-pr
-      if: steps.changes.outputs.has-changes == 'true'
+      if: steps.changes.outputs.has-changes == 'true' || github.event_name == 'pull_request'
       shell: bash
       env:
         GH_TOKEN: ${{ inputs.github-token }}
       run: |
-        BRANCH="${{ steps.push.outputs.branch }}"
-        BASE="${{ inputs.base-branch }}"
-        TITLE="Soundcheck: security review findings"
         BODY="$(cat /tmp/soundcheck-summary.md)"
 
-        EXISTING=$(gh pr list \
-          --head "$BRANCH" \
-          --base "$BASE" \
-          --state open \
-          --json number \
-          --jq '.[0].number' \
-          2>/dev/null || echo "")
-
-        if [ -n "$EXISTING" ]; then
-          echo "Updating existing PR #$EXISTING"
-          gh pr edit "$EXISTING" --body "$BODY"
-          PR_URL=$(gh pr view "$EXISTING" --json url --jq '.url')
+        if [ "${{ github.event_name }}" = "pull_request" ]; then
+          # Update the body of the PR that triggered this run
+          PR_NUMBER="${{ github.event.pull_request.number }}"
+          echo "Updating PR #$PR_NUMBER"
+          gh pr edit "$PR_NUMBER" --body "$BODY"
+          PR_URL=$(gh pr view "$PR_NUMBER" --json url --jq '.url')
         else
-          echo "Opening new PR"
-          PR_URL=$(gh pr create \
-            --title "$TITLE" \
-            --body "$BODY" \
+          BRANCH="${{ steps.push.outputs.branch }}"
+          BASE="${{ inputs.base-branch }}"
+          TITLE="Soundcheck: security review findings"
+
+          EXISTING=$(gh pr list \
             --head "$BRANCH" \
             --base "$BASE" \
-            --label "security" 2>/dev/null || \
-          gh pr create \
-            --title "$TITLE" \
-            --body "$BODY" \
-            --head "$BRANCH" \
-            --base "$BASE")
+            --state open \
+            --json number \
+            --jq '.[0].number' \
+            2>/dev/null || echo "")
+
+          if [ -n "$EXISTING" ]; then
+            echo "Updating existing PR #$EXISTING"
+            gh pr edit "$EXISTING" --body "$BODY"
+            PR_URL=$(gh pr view "$EXISTING" --json url --jq '.url')
+          else
+            echo "Opening new PR"
+            PR_URL=$(gh pr create \
+              --title "$TITLE" \
+              --body "$BODY" \
+              --head "$BRANCH" \
+              --base "$BASE" \
+              --label "security" 2>/dev/null || \
+            gh pr create \
+              --title "$TITLE" \
+              --body "$BODY" \
+              --head "$BRANCH" \
+              --base "$BASE")
+          fi
         fi
 
         echo "pr-url=$PR_URL" >> "$GITHUB_OUTPUT"
