@@ -51,12 +51,15 @@ machine-readable format so they can be applied automatically.
 
 For each Critical, High, or Medium finding where you rewrote a file, output one block:
 
+<example>
 <soundcheck-rewrite file="relative/path/to/file">
 complete rewritten file content — the full file, not a diff
 </soundcheck-rewrite>
+</example>
 
 Then output a JSON findings list:
 
+<example>
 <soundcheck-findings>
 [
   {
@@ -68,6 +71,7 @@ Then output a JSON findings list:
   }
 ]
 </soundcheck-findings>
+</example>
 
 Severity definitions:
 - Critical: exploitable remotely, no authentication required
@@ -125,20 +129,25 @@ def build_user_prompt(files: list[tuple[str, str]]) -> str:
     return "\n".join(parts)
 
 
+def _strip_examples(text: str) -> str:
+    """Remove <example>...</example> blocks so parsers ignore template content."""
+    return re.sub(r"<example>.*?</example>", "", text, flags=re.DOTALL)
+
+
 def parse_rewrites(response: str) -> dict[str, str]:
     """Extract <soundcheck-rewrite file="..."> blocks from the response."""
     pattern = re.compile(
         r'<soundcheck-rewrite\s+file="([^"]+)">\n(.*?)\n</soundcheck-rewrite>',
         re.DOTALL,
     )
-    return {m.group(1): m.group(2) for m in pattern.finditer(response)}
+    return {m.group(1): m.group(2) for m in pattern.finditer(_strip_examples(response))}
 
 
 def parse_findings(response: str) -> list[dict]:
     """Extract <soundcheck-findings> JSON array from the response."""
     match = re.search(
         r"<soundcheck-findings>\s*(\[.*?\])\s*</soundcheck-findings>",
-        response,
+        _strip_examples(response),
         re.DOTALL,
     )
     if not match:
@@ -257,7 +266,17 @@ def main() -> int:
         print(f"ERROR: skill not found: {skill_path}", file=sys.stderr)
         return 1
 
-    system_prompt = skill_path.read_text(encoding="utf-8") + SYSTEM_SUFFIX
+    # Load the orchestrating skill plus all sibling skills so Claude has the
+    # full content of each skill it is asked to invoke.
+    skills_dir = skill_path.parent.parent  # e.g. /tmp/soundcheck/skills/
+    skill_sections = [skill_path.read_text(encoding="utf-8")]
+    for sibling in sorted(skills_dir.iterdir()):
+        if sibling == skill_path.parent or not sibling.is_dir():
+            continue
+        sibling_skill = sibling / "SKILL.md"
+        if sibling_skill.exists():
+            skill_sections.append(sibling_skill.read_text(encoding="utf-8"))
+    system_prompt = "\n\n---\n\n".join(skill_sections) + SYSTEM_SUFFIX
 
     print(f"Collecting source files from {repo_dir} (max {args.max_files})...")
     files = collect_files(repo_dir, args.max_files)
