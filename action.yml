@@ -53,7 +53,11 @@ runs:
     - name: Download Soundcheck skills
       shell: bash
       run: |
-        git clone --depth 1 https://github.com/thejefflarson/soundcheck /tmp/soundcheck
+        # Pin to a specific commit SHA to prevent supply-chain substitution attacks.
+        # Update this SHA when intentionally pulling in new soundcheck changes.
+        SOUNDCHECK_SHA="b3591a2b3fcbae03c4ceef10826f96b8e2bdc0dd"
+        git clone https://github.com/thejefflarson/soundcheck /tmp/soundcheck
+        git -C /tmp/soundcheck checkout "$SOUNDCHECK_SHA"
 
     - name: Run security review
       id: review
