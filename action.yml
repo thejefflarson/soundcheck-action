@@ -55,7 +55,7 @@ runs:
       run: |
         # Pin to a specific commit SHA to prevent supply-chain substitution attacks.
         # Update this SHA when intentionally pulling in new soundcheck changes.
-        SOUNDCHECK_SHA="b3591a2b3fcbae03c4ceef10826f96b8e2bdc0dd"
+        SOUNDCHECK_SHA="f71fd2c8cf5b22ed21e5d93cebfa31374c8c29be"
         git clone https://github.com/thejefflarson/soundcheck /tmp/soundcheck
         git -C /tmp/soundcheck checkout "$SOUNDCHECK_SHA"
 
@@ -68,7 +68,7 @@ runs:
         set +e
         python "$GITHUB_ACTION_PATH/scripts/security-review-action.py" \
           --repo-dir "$GITHUB_WORKSPACE" \
-          --skill-path /tmp/soundcheck/skills/security-review/SKILL.md \
+          --skill-path /tmp/soundcheck/.claude/skills/security-review/SKILL.md \
           --max-files "${{ inputs.max-files }}" \
           --model "${{ inputs.model }}" \
           --output-summary /tmp/soundcheck-summary.md \
