@@ -1,5 +1,5 @@
 name: Soundcheck Security Review
-description: "OWASP security review that rewrites Critical/High/Medium findings and opens a PR with a severity-ranked findings table."
+description: "OWASP security review that comments a severity-ranked findings table on every PR, and can rewrite Critical/High/Medium findings in place."
 
 branding:
   icon: shield
@@ -11,52 +11,67 @@ inputs:
     required: true
   github-token:
     description: >
-      GitHub token with contents:write and pull-requests:write permissions.
+      GitHub token with pull-requests:write. Also contents:write if
+      autofix is enabled so rewrites can be committed back to the branch.
       Use secrets.GITHUB_TOKEN for most repos.
     required: true
   base-branch:
-    description: "Branch to open the PR against (default: the repo's default branch)"
+    description: "Branch to diff against on PRs and open PRs into on scheduled runs (default: the repo's default branch)"
     required: false
     default: "${{ github.event.repository.default_branch }}"
-  max-files:
-    description: >
-      Maximum number of source files to include in the review.
-      Increase for large repos; reduce to cut API cost.
-    required: false
-    default: "50"
   model:
-    description: Claude model to use for the review
+    description: "Claude model to use for the review (accepts any value `claude -p --model` accepts: short alias like `sonnet`/`haiku` or a full model id)"
     required: false
-    default: claude-sonnet-4-6
+    default: sonnet
+  autofix:
+    description: "If true, grant the reviewer Edit access so it can rewrite vulnerable code. Requires github-token with contents:write. Default true to match v1 behavior."
+    required: false
+    default: "true"
+  max-budget-usd:
+    description: Aggregate spend cap (USD) across the review + any autofix pass
+    required: false
+    default: "5"
+  timeout-seconds:
+    description: Subprocess timeout passed through to the reviewer CLI
+    required: false
+    default: "900"
 
 outputs:
   pr-url:
-    description: URL of the opened or updated pull request (empty if no findings)
-    value: ${{ steps.open-pr.outputs.pr-url }}
+    description: URL of the opened/updated PR (scheduled runs) or the triggering PR (pull_request runs). Empty when nothing was posted.
+    value: ${{ steps.post.outputs.pr-url }}
   findings-count:
-    description: Total number of findings across all severities
+    description: Total findings returned by the reviewer
     value: ${{ steps.review.outputs.findings-count }}
+  exit-code:
+    description: Exit code from the reviewer CLI (0 clean, 1 Critical/High findings, 2 infrastructure error)
+    value: ${{ steps.review.outputs.exit-code }}
 
 runs:
   using: composite
 
   steps:
     - name: Set up Python
-      uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065 # v5
+      uses: actions/setup-python@a309ff8b426b58ec0e2a45f0f869d46889d02405 # v6.2.0
       with:
         python-version: "3.11"
 
-    - name: Install dependencies
-      shell: bash
-      run: pip install anthropic
+    - name: Set up Node
+      uses: actions/setup-node@53b83947a5a98c8d113130e565377fae1a50d02f # v6.3.0
+      with:
+        node-version: "20"
 
-    - name: Download Soundcheck skills
+    - name: Install claude CLI
+      shell: bash
+      run: npm install -g '@anthropic-ai/claude-code@2.1.108'
+
+    - name: Check out soundcheck at pinned SHA
       shell: bash
       run: |
-        # Pin to a specific commit SHA to prevent supply-chain substitution attacks.
+        # Pin to a specific commit SHA to prevent supply-chain substitution.
         # Update this SHA when intentionally pulling in new soundcheck changes.
         SOUNDCHECK_SHA="e63ae370383da2d1f88f2c93661eb7b826f18023"
-        git clone https://github.com/thejefflarson/soundcheck /tmp/soundcheck
+        git clone --filter=blob:none https://github.com/thejefflarson/soundcheck /tmp/soundcheck
         git -C /tmp/soundcheck checkout "$SOUNDCHECK_SHA"
 
     - name: Run security review
@@ -66,38 +81,58 @@ runs:
         ANTHROPIC_API_KEY: ${{ inputs.anthropic-api-key }}
       run: |
         set +e
-        python "$GITHUB_ACTION_PATH/scripts/security-review-action.py" \
-          --repo-dir "$GITHUB_WORKSPACE" \
-          --skill-path /tmp/soundcheck/.claude/skills/security-review/SKILL.md \
-          --max-files "${{ inputs.max-files }}" \
-          --model "${{ inputs.model }}" \
-          --output-summary /tmp/soundcheck-summary.md \
-          --output-findings /tmp/soundcheck-findings.json
-        echo "exit-code=$?" >> "$GITHUB_OUTPUT"
 
-        FINDINGS=$(grep -c "^| [🔴🟠🟡🔵]" /tmp/soundcheck-summary.md 2>/dev/null || echo "0")
-        echo "findings-count=$FINDINGS" >> "$GITHUB_OUTPUT"
-        if [ -f /tmp/soundcheck-findings.json ]; then
-          echo "has-findings=true" >> "$GITHUB_OUTPUT"
-        else
-          echo "has-findings=false" >> "$GITHUB_OUTPUT"
+        EVENT="${{ github.event_name }}"
+        BASE="${{ inputs.base-branch }}"
+
+        # Assemble the CLI args. PRs get a diff-scoped review against the
+        # base branch; schedule/workflow_dispatch runs do a full-repo scan.
+        ARGS=(
+          --repo-dir "$GITHUB_WORKSPACE"
+          --skill-path /tmp/soundcheck/.claude/skills/security-review/SKILL.md
+          --model "${{ inputs.model }}"
+          --max-budget-usd "${{ inputs.max-budget-usd }}"
+          --timeout "${{ inputs.timeout-seconds }}"
+          --output-summary /tmp/soundcheck-summary.md
+          --audit-log /tmp/soundcheck-audit.json
+        )
+
+        if [ "$EVENT" = "pull_request" ]; then
+          # Fetch the base branch so --diff-base has something to diff against.
+          git -C "$GITHUB_WORKSPACE" fetch --no-tags --depth=1 origin "$BASE"
+          ARGS+=(--diff-base "origin/$BASE")
         fi
 
-    - name: Check for rewritten files
+        if [ "${{ inputs.autofix }}" = "true" ]; then
+          ARGS+=(--autofix)
+        fi
+
+        python /tmp/soundcheck/scripts/security-review-action.py "${ARGS[@]}"
+        CLI_EXIT=$?
+        echo "exit-code=$CLI_EXIT" >> "$GITHUB_OUTPUT"
+
+        if [ -f /tmp/soundcheck-audit.json ]; then
+          # jq is preinstalled on ubuntu-latest runners
+          FINDINGS=$(jq '.findings_total // 0' /tmp/soundcheck-audit.json)
+        else
+          FINDINGS=0
+        fi
+        echo "findings-count=$FINDINGS" >> "$GITHUB_OUTPUT"
+
+    - name: Detect rewrites
       id: changes
       shell: bash
       run: |
-        git -C "$GITHUB_WORKSPACE" add -A
-        if git -C "$GITHUB_WORKSPACE" diff --cached --quiet; then
+        cd "$GITHUB_WORKSPACE"
+        if git diff --quiet; then
           echo "has-changes=false" >> "$GITHUB_OUTPUT"
-          echo "No files were rewritten — skipping PR."
         else
           echo "has-changes=true" >> "$GITHUB_OUTPUT"
-          echo "Rewritten files detected."
-          git -C "$GITHUB_WORKSPACE" diff --cached --name-only
+          echo "Rewritten files:"
+          git diff --name-only
         fi
 
-    - name: Commit and push to review branch
+    - name: Commit and push rewrites
       id: push
       if: steps.changes.outputs.has-changes == 'true'
       shell: bash
@@ -107,96 +142,94 @@ runs:
         cd "$GITHUB_WORKSPACE"
         git config user.name  "soundcheck[bot]"
         git config user.email "soundcheck[bot]@users.noreply.github.com"
+        COMMIT_MSG=$'Soundcheck: apply security review fixes\n\nAutomated rewrites from the Soundcheck security review action.'
 
         if [ "${{ github.event_name }}" = "pull_request" ]; then
-          # Commit fixes directly onto the PR branch
           BRANCH="${{ github.head_ref }}"
           git add -A
-          git commit -m $'Soundcheck: apply security review fixes\n\nAutomated fixes from the Soundcheck security review action.\nReview the findings table in the PR description for details.'
-          git push origin "$BRANCH"
+          git commit -m "$COMMIT_MSG"
+          git push origin "HEAD:$BRANCH"
         else
-          # Stash the staged rewrites, switch to (or create) the review branch, pop them
           BRANCH="soundcheck/security-review"
-          git stash
+          BASE="${{ inputs.base-branch }}"
+          # Stash rewrites, reset to a clean copy of the base, then replay.
+          git stash push --include-untracked
+          git fetch --no-tags origin "$BASE"
           if git ls-remote --exit-code --heads origin "$BRANCH" > /dev/null 2>&1; then
-            git checkout "$BRANCH"
-            git reset --hard "origin/${{ inputs.base-branch }}"
+            git fetch --no-tags origin "$BRANCH"
+            git checkout -B "$BRANCH" "origin/$BASE"
           else
-            git checkout -b "$BRANCH" "origin/${{ inputs.base-branch }}"
+            git checkout -b "$BRANCH" "origin/$BASE"
           fi
           git stash pop
           git add -A
-          git commit -m $'Soundcheck: apply security review fixes\n\nAutomated fixes from the Soundcheck security review action.\nReview the findings table in the PR description for details.'
-          git push origin "$BRANCH" --force
+          git commit -m "$COMMIT_MSG"
+          git push origin "$BRANCH" --force-with-lease
         fi
-
         echo "branch=$BRANCH" >> "$GITHUB_OUTPUT"
 
-    - name: Open or update pull request
-      id: open-pr
-      if: steps.changes.outputs.has-changes == 'true' || github.event_name == 'pull_request'
+    - name: Post findings
+      id: post
+      if: always() && hashFiles('/tmp/soundcheck-summary.md') != ''
       shell: bash
       env:
         GH_TOKEN: ${{ inputs.github-token }}
       run: |
-        BODY="$(cat /tmp/soundcheck-summary.md)"
+        BODY_FILE=/tmp/soundcheck-summary.md
 
         if [ "${{ github.event_name }}" = "pull_request" ]; then
-          # Comment findings on the PR that triggered this run
           PR_NUMBER="${{ github.event.pull_request.number }}"
-          echo "Commenting on PR #$PR_NUMBER"
-          gh pr comment "$PR_NUMBER" --body "$BODY"
-          PR_URL=$(gh pr view "$PR_NUMBER" --json url --jq '.url')
-        else
+          gh pr comment "$PR_NUMBER" --body-file "$BODY_FILE" \
+            --repo "${{ github.repository }}"
+          PR_URL=$(gh pr view "$PR_NUMBER" --json url --jq '.url' \
+            --repo "${{ github.repository }}")
+          echo "pr-url=$PR_URL" >> "$GITHUB_OUTPUT"
+        elif [ "${{ steps.changes.outputs.has-changes }}" = "true" ]; then
           BRANCH="${{ steps.push.outputs.branch }}"
           BASE="${{ inputs.base-branch }}"
           TITLE="Soundcheck: security review findings"
-
           EXISTING=$(gh pr list \
-            --head "$BRANCH" \
-            --base "$BASE" \
-            --state open \
-            --json number \
-            --jq '.[0].number' \
-            2>/dev/null || echo "")
-
+            --head "$BRANCH" --base "$BASE" --state open \
+            --json number --jq '.[0].number' \
+            --repo "${{ github.repository }}" 2>/dev/null || echo "")
           if [ -n "$EXISTING" ]; then
-            echo "Updating existing PR #$EXISTING"
-            gh pr edit "$EXISTING" --body "$BODY"
-            PR_URL=$(gh pr view "$EXISTING" --json url --jq '.url')
+            gh pr edit "$EXISTING" --body-file "$BODY_FILE" \
+              --repo "${{ github.repository }}"
+            PR_URL=$(gh pr view "$EXISTING" --json url --jq '.url' \
+              --repo "${{ github.repository }}")
           else
-            echo "Opening new PR"
             PR_URL=$(gh pr create \
-              --title "$TITLE" \
-              --body "$BODY" \
-              --head "$BRANCH" \
-              --base "$BASE" \
-              --label "security" 2>/dev/null || \
+              --title "$TITLE" --body-file "$BODY_FILE" \
+              --head "$BRANCH" --base "$BASE" \
+              --repo "${{ github.repository }}" \
+              --label security 2>/dev/null || \
             gh pr create \
-              --title "$TITLE" \
-              --body "$BODY" \
-              --head "$BRANCH" \
-              --base "$BASE")
+              --title "$TITLE" --body-file "$BODY_FILE" \
+              --head "$BRANCH" --base "$BASE" \
+              --repo "${{ github.repository }}")
           fi
+          echo "pr-url=$PR_URL" >> "$GITHUB_OUTPUT"
         fi
-
-        echo "pr-url=$PR_URL" >> "$GITHUB_OUTPUT"
-        echo "PR: $PR_URL"
 
     - name: Write job summary
       if: always()
       shell: bash
       run: |
-        cat /tmp/soundcheck-summary.md >> "$GITHUB_STEP_SUMMARY" 2>/dev/null || \
+        if [ -f /tmp/soundcheck-summary.md ]; then
+          cat /tmp/soundcheck-summary.md >> "$GITHUB_STEP_SUMMARY"
+        else
           echo "No summary generated." >> "$GITHUB_STEP_SUMMARY"
-        if [ -n "${{ steps.open-pr.outputs.pr-url }}" ]; then
-          echo "" >> "$GITHUB_STEP_SUMMARY"
-          echo "**PR:** ${{ steps.open-pr.outputs.pr-url }}" >> "$GITHUB_STEP_SUMMARY"
+        fi
+        if [ -n "${{ steps.post.outputs.pr-url }}" ]; then
+          {
+            echo
+            echo "**PR:** ${{ steps.post.outputs.pr-url }}"
+          } >> "$GITHUB_STEP_SUMMARY"
         fi
 
-    - name: Upload findings JSON
-      if: steps.review.outputs.has-findings == 'true'
+    - name: Upload audit record
+      if: always() && hashFiles('/tmp/soundcheck-audit.json') != ''
       uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
       with:
-        name: soundcheck-findings
-        path: /tmp/soundcheck-findings.json
+        name: soundcheck-audit
+        path: /tmp/soundcheck-audit.json
