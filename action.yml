@@ -144,9 +144,18 @@ runs:
         git config user.email "soundcheck[bot]@users.noreply.github.com"
         COMMIT_MSG=$'Soundcheck: apply security review fixes\n\nAutomated rewrites from the Soundcheck security review action.'
 
+        # GITHUB_TOKEN is not allowed to modify .github/workflows/*; exclude
+        # those paths so pushes don't get rejected when autofix touches them.
+        STAGE_SPEC=(-- . ':!.github/workflows')
+
         if [ "${{ github.event_name }}" = "pull_request" ]; then
           BRANCH="${{ github.head_ref }}"
-          git add -A
+          git add -A "${STAGE_SPEC[@]}"
+          if git diff --cached --quiet; then
+            echo "Only workflow-file rewrites; nothing the default token can push."
+            echo "has-changes=false" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
           git commit -m "$COMMIT_MSG"
           git push origin "HEAD:$BRANCH"
         else
@@ -162,7 +171,12 @@ runs:
             git checkout -b "$BRANCH" "origin/$BASE"
           fi
           git stash pop
-          git add -A
+          git add -A "${STAGE_SPEC[@]}"
+          if git diff --cached --quiet; then
+            echo "Only workflow-file rewrites; nothing the default token can push."
+            echo "has-changes=false" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
           git commit -m "$COMMIT_MSG"
           git push origin "$BRANCH" --force-with-lease
         fi
