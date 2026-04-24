@@ -101,6 +101,15 @@ runs:
           # Fetch the base branch so --diff-base has something to diff against.
           git -C "$GITHUB_WORKSPACE" fetch --no-tags --depth=1 origin "$BASE"
           ARGS+=(--diff-base "origin/$BASE")
+        elif [ "$EVENT" = "push" ]; then
+          # Diff the push against the pre-push tip of the branch.
+          # For brand-new branches (before=zeros) fall through to a full scan.
+          BEFORE="${{ github.event.before }}"
+          ZERO="0000000000000000000000000000000000000000"
+          if [ -n "$BEFORE" ] && [ "$BEFORE" != "$ZERO" ]; then
+            git -C "$GITHUB_WORKSPACE" fetch --no-tags --depth=1 origin "$BEFORE" 2>/dev/null || true
+            ARGS+=(--diff-base "$BEFORE")
+          fi
         fi
 
         if [ "${{ inputs.autofix }}" = "true" ]; then
@@ -226,6 +235,12 @@ runs:
               --head "$BRANCH" --base "$BASE" \
               --repo "${{ github.repository }}")
           fi
+          # Queue auto-merge so the PR lands the moment required checks pass.
+          # Non-fatal if the repo hasn't enabled auto-merge or required checks
+          # are still configuring — the PR just stays open for manual review.
+          gh pr merge "$PR_URL" --auto --merge \
+            --repo "${{ github.repository }}" 2>/dev/null || \
+            echo "Auto-merge not enabled on repo; PR stays open."
           echo "pr-url=$PR_URL" >> "$GITHUB_OUTPUT"
         fi
 
