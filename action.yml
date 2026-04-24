@@ -184,12 +184,16 @@ runs:
 
     - name: Post findings
       id: post
-      if: always() && hashFiles('/tmp/soundcheck-summary.md') != ''
+      if: always()
       shell: bash
       env:
         GH_TOKEN: ${{ inputs.github-token }}
       run: |
         BODY_FILE=/tmp/soundcheck-summary.md
+        if [ ! -f "$BODY_FILE" ]; then
+          echo "No summary file generated; skipping PR/comment."
+          exit 0
+        fi
 
         if [ "${{ github.event_name }}" = "pull_request" ]; then
           PR_NUMBER="${{ github.event.pull_request.number }}"
@@ -242,8 +246,9 @@ runs:
         fi
 
     - name: Upload audit record
-      if: always() && hashFiles('/tmp/soundcheck-audit.json') != ''
+      if: always()
       uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
       with:
         name: soundcheck-audit
         path: /tmp/soundcheck-audit.json
+        if-no-files-found: ignore
