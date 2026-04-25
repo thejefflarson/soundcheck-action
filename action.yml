@@ -211,7 +211,11 @@ runs:
           PR_URL=$(gh pr view "$PR_NUMBER" --json url --jq '.url' \
             --repo "${{ github.repository }}")
           echo "pr-url=$PR_URL" >> "$GITHUB_OUTPUT"
-        elif [ "${{ steps.changes.outputs.has-changes }}" = "true" ]; then
+        elif [ -n "${{ steps.push.outputs.branch }}" ]; then
+          # Only open a PR if the push step actually committed + pushed a
+          # branch. The `changes` step's has-changes can be true even when
+          # only workflow files were rewritten (which the default token
+          # cannot push), in which case push.outputs.branch is empty.
           BRANCH="${{ steps.push.outputs.branch }}"
           BASE="${{ inputs.base-branch }}"
           TITLE="Soundcheck: security review findings"
