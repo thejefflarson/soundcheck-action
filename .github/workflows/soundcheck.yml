@@ -15,7 +15,7 @@ jobs:
       pull-requests: write
     steps:
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd  # v6.0.2
-      - uses: thejefflarson/soundcheck-action@ba406c301382211d66118ebcc699267745f7f849  # v2.1.2
+      - uses: thejefflarson/soundcheck-action@91131c2bfd56ad90e607776c3e835b6cc5ae0495  # v2.1.3
         with:
           anthropic-api-key: ${{ secrets.ANTHROPIC_API_KEY }}
           github-token: ${{ secrets.GITHUB_TOKEN }}
