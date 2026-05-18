@@ -24,9 +24,9 @@ inputs:
     required: false
     default: sonnet
   autofix:
-    description: "If true, grant the reviewer Edit access so it can rewrite vulnerable code. Requires github-token with contents:write. Default true to match v1 behavior."
+    description: "If true, grant the reviewer Edit access so it can rewrite vulnerable code. Requires github-token with contents:write. Defaults to false; enable only after confirming branch-protection and human-review requirements are in place."
     required: false
-    default: "true"
+    default: "false"
   max-budget-usd:
     description: Aggregate spend cap (USD) across the review + any autofix pass
     required: false
@@ -63,7 +63,7 @@ runs:
 
     - name: Install claude CLI
       shell: bash
-      run: npm install -g '@anthropic-ai/claude-code@2.1.108'
+      run: npm install -g '@anthropic-ai/claude-code@2.1.108' --ignore-scripts
 
     - name: Check out soundcheck at pinned SHA
       shell: bash
@@ -79,20 +79,34 @@ runs:
       shell: bash
       env:
         ANTHROPIC_API_KEY: ${{ inputs.anthropic-api-key }}
+        # Pass all caller-supplied values via env to prevent shell injection
+        # (finding: unsafe-api-consumption, injection).
+        SOUNDCHECK_MODEL: ${{ inputs.model }}
+        SOUNDCHECK_BUDGET: ${{ inputs.max-budget-usd }}
+        SOUNDCHECK_TIMEOUT: ${{ inputs.timeout-seconds }}
+        SOUNDCHECK_AUTOFIX: ${{ inputs.autofix }}
+        SOUNDCHECK_EVENT: ${{ github.event_name }}
+        SOUNDCHECK_BASE: ${{ inputs.base-branch }}
+        SOUNDCHECK_BEFORE: ${{ github.event.before }}
       run: |
-        set +e
+        # Validate and cap timeout to prevent unbounded runner consumption
+        # (finding: insecure-design).
+        TIMEOUT_VAL="${SOUNDCHECK_TIMEOUT:-900}"
+        if ! [[ "$TIMEOUT_VAL" =~ ^[0-9]+$ ]] || [ "$TIMEOUT_VAL" -gt 3600 ]; then
+          TIMEOUT_VAL=900
+        fi
 
-        EVENT="${{ github.event_name }}"
-        BASE="${{ inputs.base-branch }}"
+        EVENT="$SOUNDCHECK_EVENT"
+        BASE="$SOUNDCHECK_BASE"
 
         # Assemble the CLI args. PRs get a diff-scoped review against the
         # base branch; schedule/workflow_dispatch runs do a full-repo scan.
         ARGS=(
           --repo-dir "$GITHUB_WORKSPACE"
           --skill-path /tmp/soundcheck/.claude/skills/security-review/SKILL.md
-          --model "${{ inputs.model }}"
-          --max-budget-usd "${{ inputs.max-budget-usd }}"
-          --timeout "${{ inputs.timeout-seconds }}"
+          --model "$SOUNDCHECK_MODEL"
+          --max-budget-usd "$SOUNDCHECK_BUDGET"
+          --timeout "$TIMEOUT_VAL"
           --output-summary /tmp/soundcheck-summary.md
           --audit-log /tmp/soundcheck-audit.json
         )
@@ -104,7 +118,7 @@ runs:
         elif [ "$EVENT" = "push" ]; then
           # Diff the push against the pre-push tip of the branch.
           # For brand-new branches (before=zeros) fall through to a full scan.
-          BEFORE="${{ github.event.before }}"
+          BEFORE="$SOUNDCHECK_BEFORE"
           ZERO="0000000000000000000000000000000000000000"
           if [ -n "$BEFORE" ] && [ "$BEFORE" != "$ZERO" ]; then
             git -C "$GITHUB_WORKSPACE" fetch --no-tags --depth=1 origin "$BEFORE" 2>/dev/null || true
@@ -112,12 +126,15 @@ runs:
           fi
         fi
 
-        if [ "${{ inputs.autofix }}" = "true" ]; then
+        if [ "$SOUNDCHECK_AUTOFIX" = "true" ]; then
           ARGS+=(--autofix)
         fi
 
-        python /tmp/soundcheck/scripts/security-review-action.py "${ARGS[@]}"
-        CLI_EXIT=$?
+        # Capture exit without globally disabling errexit (finding: security-misconfiguration).
+        # The reviewer exits 1 on Critical/High findings and 2 on infra error;
+        # both are non-fatal for the step so we can still post comments.
+        CLI_EXIT=0
+        python /tmp/soundcheck/scripts/security-review-action.py "${ARGS[@]}" || CLI_EXIT=$?
         echo "exit-code=$CLI_EXIT" >> "$GITHUB_OUTPUT"
 
         if [ -f /tmp/soundcheck-audit.json ]; then
@@ -147,6 +164,11 @@ runs:
       shell: bash
       env:
         GH_TOKEN: ${{ inputs.github-token }}
+        # Isolate attacker-controlled values from shell expansion
+        # (finding: injection — github.head_ref is PR branch name).
+        SOUNDCHECK_EVENT: ${{ github.event_name }}
+        SOUNDCHECK_HEAD_REF: ${{ github.head_ref }}
+        SOUNDCHECK_BASE: ${{ inputs.base-branch }}
       run: |
         cd "$GITHUB_WORKSPACE"
         git config user.name  "soundcheck[bot]"
@@ -155,11 +177,13 @@ runs:
 
         # GITHUB_TOKEN is not allowed to modify .github/workflows/*; exclude
         # those paths so pushes don't get rejected when autofix touches them.
+        # Use -u (tracked files only) to avoid staging untracked files created
+        # by untrusted diff content (finding: integrity-failures).
         STAGE_SPEC=(-- . ':!.github/workflows')
 
-        if [ "${{ github.event_name }}" = "pull_request" ]; then
-          BRANCH="${{ github.head_ref }}"
-          git add -A "${STAGE_SPEC[@]}"
+        if [ "$SOUNDCHECK_EVENT" = "pull_request" ]; then
+          BRANCH="$SOUNDCHECK_HEAD_REF"
+          git add -u "${STAGE_SPEC[@]}"
           if git diff --cached --quiet; then
             echo "Only workflow-file rewrites; nothing the default token can push."
             echo "has-changes=false" >> "$GITHUB_OUTPUT"
@@ -169,7 +193,7 @@ runs:
           git push origin "HEAD:$BRANCH"
         else
           BRANCH="soundcheck/security-review"
-          BASE="${{ inputs.base-branch }}"
+          BASE="$SOUNDCHECK_BASE"
           # Stash rewrites, reset to a clean copy of the base, then replay.
           git stash push --include-untracked
           git fetch --no-tags origin "$BASE"
@@ -180,13 +204,17 @@ runs:
             git checkout -b "$BRANCH" "origin/$BASE"
           fi
           git stash pop
-          git add -A "${STAGE_SPEC[@]}"
+          git add -u "${STAGE_SPEC[@]}"
           if git diff --cached --quiet; then
             echo "Only workflow-file rewrites; nothing the default token can push."
             echo "has-changes=false" >> "$GITHUB_OUTPUT"
             exit 0
           fi
           git commit -m "$COMMIT_MSG"
+          # Re-fetch remote tip immediately before push so --force-with-lease
+          # checks the correct remote state, not a stale tracking ref
+          # (finding: integrity-failures).
+          git fetch --no-tags origin "$BRANCH" 2>/dev/null || true
           git push origin "$BRANCH" --force-with-lease
         fi
         echo "branch=$BRANCH" >> "$GITHUB_OUTPUT"
@@ -197,6 +225,13 @@ runs:
       shell: bash
       env:
         GH_TOKEN: ${{ inputs.github-token }}
+        # Isolate all context values from shell expansion
+        # (finding: injection, insecure-output-handling).
+        SOUNDCHECK_EVENT: ${{ github.event_name }}
+        SOUNDCHECK_PR_NUMBER: ${{ github.event.pull_request.number }}
+        SOUNDCHECK_REPO: ${{ github.repository }}
+        SOUNDCHECK_PUSH_BRANCH: ${{ steps.push.outputs.branch }}
+        SOUNDCHECK_BASE: ${{ inputs.base-branch }}
       run: |
         BODY_FILE=/tmp/soundcheck-summary.md
         if [ ! -f "$BODY_FILE" ]; then
@@ -204,70 +239,81 @@ runs:
           exit 0
         fi
 
-        if [ "${{ github.event_name }}" = "pull_request" ]; then
-          PR_NUMBER="${{ github.event.pull_request.number }}"
+        # Truncate to prevent oversized PR comments (finding: insecure-design).
+        MAX_BYTES=65536
+        if [ "$(wc -c < "$BODY_FILE")" -gt "$MAX_BYTES" ]; then
+          { head -c "$MAX_BYTES" "$BODY_FILE"; printf '\n\n*(truncated — see audit artifact for full output)*\n'; } > "${BODY_FILE}.tmp"
+          mv "${BODY_FILE}.tmp" "$BODY_FILE"
+        fi
+
+        if [ "$SOUNDCHECK_EVENT" = "pull_request" ]; then
+          PR_NUMBER="$SOUNDCHECK_PR_NUMBER"
           gh pr comment "$PR_NUMBER" --body-file "$BODY_FILE" \
-            --repo "${{ github.repository }}"
+            --repo "$SOUNDCHECK_REPO"
           PR_URL=$(gh pr view "$PR_NUMBER" --json url --jq '.url' \
-            --repo "${{ github.repository }}")
+            --repo "$SOUNDCHECK_REPO")
           echo "pr-url=$PR_URL" >> "$GITHUB_OUTPUT"
-        elif [ -n "${{ steps.push.outputs.branch }}" ]; then
+        elif [ -n "$SOUNDCHECK_PUSH_BRANCH" ]; then
           # Only open a PR if the push step actually committed + pushed a
           # branch. The `changes` step's has-changes can be true even when
           # only workflow files were rewritten (which the default token
           # cannot push), in which case push.outputs.branch is empty.
-          BRANCH="${{ steps.push.outputs.branch }}"
-          BASE="${{ inputs.base-branch }}"
+          BRANCH="$SOUNDCHECK_PUSH_BRANCH"
+          BASE="$SOUNDCHECK_BASE"
           TITLE="Soundcheck: security review findings"
           EXISTING=$(gh pr list \
             --head "$BRANCH" --base "$BASE" --state open \
             --json number --jq '.[0].number' \
-            --repo "${{ github.repository }}" 2>/dev/null || echo "")
+            --repo "$SOUNDCHECK_REPO" 2>/dev/null || echo "")
           if [ -n "$EXISTING" ]; then
             gh pr edit "$EXISTING" --body-file "$BODY_FILE" \
-              --repo "${{ github.repository }}"
+              --repo "$SOUNDCHECK_REPO"
             PR_URL=$(gh pr view "$EXISTING" --json url --jq '.url' \
-              --repo "${{ github.repository }}")
+              --repo "$SOUNDCHECK_REPO")
           else
             PR_URL=$(gh pr create \
               --title "$TITLE" --body-file "$BODY_FILE" \
               --head "$BRANCH" --base "$BASE" \
-              --repo "${{ github.repository }}" \
+              --repo "$SOUNDCHECK_REPO" \
               --label security 2>/dev/null || \
             gh pr create \
               --title "$TITLE" --body-file "$BODY_FILE" \
               --head "$BRANCH" --base "$BASE" \
-              --repo "${{ github.repository }}")
+              --repo "$SOUNDCHECK_REPO")
           fi
-          # Queue auto-merge so the PR lands the moment required checks pass.
-          # Non-fatal if the repo hasn't enabled auto-merge or required checks
-          # are still configuring — the PR just stays open for manual review.
-          gh pr merge "$PR_URL" --auto --merge \
-            --repo "${{ github.repository }}" 2>/dev/null || \
-            echo "Auto-merge not enabled on repo; PR stays open."
+          # AI-authored PRs require explicit human review before merging;
+          # auto-merge is intentionally omitted (finding: insecure-design,
+          # excessive-agency). The PR will stay open until a human approves.
           echo "pr-url=$PR_URL" >> "$GITHUB_OUTPUT"
         fi
 
     - name: Write job summary
       if: always()
       shell: bash
+      env:
+        SOUNDCHECK_PR_URL: ${{ steps.post.outputs.pr-url }}
       run: |
         if [ -f /tmp/soundcheck-summary.md ]; then
-          cat /tmp/soundcheck-summary.md >> "$GITHUB_STEP_SUMMARY"
+          # Cap size to prevent oversized step summaries (finding: insecure-output-handling).
+          head -c 1000000 /tmp/soundcheck-summary.md >> "$GITHUB_STEP_SUMMARY"
         else
           echo "No summary generated." >> "$GITHUB_STEP_SUMMARY"
         fi
-        if [ -n "${{ steps.post.outputs.pr-url }}" ]; then
+        if [ -n "$SOUNDCHECK_PR_URL" ]; then
           {
             echo
-            echo "**PR:** ${{ steps.post.outputs.pr-url }}"
+            echo "**PR:** $SOUNDCHECK_PR_URL"
           } >> "$GITHUB_STEP_SUMMARY"
         fi
 
     - name: Upload audit record
-      if: always()
+      # Skip upload on pull_request: the artifact would be publicly accessible
+      # to the PR author before any fix is applied, disclosing vulnerability
+      # details (finding: sensitive-disclosure).
+      if: always() && github.event_name != 'pull_request'
       uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
       with:
         name: soundcheck-audit
         path: /tmp/soundcheck-audit.json
         if-no-files-found: ignore
+        retention-days: 14
