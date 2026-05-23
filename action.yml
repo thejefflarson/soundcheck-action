@@ -24,9 +24,9 @@ inputs:
     required: false
     default: sonnet
   autofix:
-    description: "If true, grant the reviewer Edit access so it can rewrite vulnerable code. Requires github-token with contents:write. Default true to match v1 behavior."
+    description: "If true, grant the reviewer Edit access so it can rewrite vulnerable code. Requires github-token with contents:write. Default false; set to 'true' to opt in."
     required: false
-    default: "true"
+    default: "false"
   max-budget-usd:
     description: Aggregate spend cap (USD) across the review + any autofix pass
     required: false
@@ -63,7 +63,7 @@ runs:
 
     - name: Install claude CLI
       shell: bash
-      run: npm install -g '@anthropic-ai/claude-code@2.1.108'
+      run: npm install -g --ignore-scripts '@anthropic-ai/claude-code@2.1.108'
 
     - name: Check out soundcheck at pinned SHA
       shell: bash
@@ -79,20 +79,35 @@ runs:
       shell: bash
       env:
         ANTHROPIC_API_KEY: ${{ inputs.anthropic-api-key }}
+        _EVENT_NAME: ${{ github.event_name }}
+        _BASE_BRANCH: ${{ inputs.base-branch }}
+        _MODEL: ${{ inputs.model }}
+        _MAX_BUDGET: ${{ inputs.max-budget-usd }}
+        _TIMEOUT: ${{ inputs.timeout-seconds }}
+        _AUTOFIX: ${{ inputs.autofix }}
+        _BEFORE: ${{ github.event.before }}
       run: |
         set +e
 
-        EVENT="${{ github.event_name }}"
-        BASE="${{ inputs.base-branch }}"
+        EVENT="$_EVENT_NAME"
+        BASE="$_BASE_BRANCH"
+
+        # Validate model against an allowlist to prevent argument injection.
+        case "$_MODEL" in
+          sonnet|haiku|opus|claude-opus-4-5|claude-sonnet-4-5|claude-haiku-4-5|\
+          claude-3-5-sonnet-*|claude-3-5-haiku-*|claude-3-opus-*)
+            ;;
+          *) echo "::error::Invalid model identifier: $_MODEL"; exit 2 ;;
+        esac
 
         # Assemble the CLI args. PRs get a diff-scoped review against the
         # base branch; schedule/workflow_dispatch runs do a full-repo scan.
         ARGS=(
           --repo-dir "$GITHUB_WORKSPACE"
           --skill-path /tmp/soundcheck/.claude/skills/security-review/SKILL.md
-          --model "${{ inputs.model }}"
-          --max-budget-usd "${{ inputs.max-budget-usd }}"
-          --timeout "${{ inputs.timeout-seconds }}"
+          --model "$_MODEL"
+          --max-budget-usd "$_MAX_BUDGET"
+          --timeout "$_TIMEOUT"
           --output-summary /tmp/soundcheck-summary.md
           --audit-log /tmp/soundcheck-audit.json
         )
@@ -104,7 +119,11 @@ runs:
         elif [ "$EVENT" = "push" ]; then
           # Diff the push against the pre-push tip of the branch.
           # For brand-new branches (before=zeros) fall through to a full scan.
-          BEFORE="${{ github.event.before }}"
+          # Validate BEFORE is a 40-hex-char git SHA to prevent shell injection.
+          BEFORE="$_BEFORE"
+          if ! [[ "$BEFORE" =~ ^[0-9a-f]{40}$ ]]; then
+            BEFORE=""
+          fi
           ZERO="0000000000000000000000000000000000000000"
           if [ -n "$BEFORE" ] && [ "$BEFORE" != "$ZERO" ]; then
             git -C "$GITHUB_WORKSPACE" fetch --no-tags --depth=1 origin "$BEFORE" 2>/dev/null || true
@@ -112,7 +131,7 @@ runs:
           fi
         fi
 
-        if [ "${{ inputs.autofix }}" = "true" ]; then
+        if [ "$_AUTOFIX" = "true" ]; then
           ARGS+=(--autofix)
         fi
 
@@ -123,6 +142,8 @@ runs:
         if [ -f /tmp/soundcheck-audit.json ]; then
           # jq is preinstalled on ubuntu-latest runners
           FINDINGS=$(jq '.findings_total // 0' /tmp/soundcheck-audit.json)
+          # Validate integer to prevent GITHUB_OUTPUT injection via newline.
+          if ! [[ "$FINDINGS" =~ ^[0-9]+$ ]]; then FINDINGS=0; fi
         else
           FINDINGS=0
         fi
@@ -147,6 +168,9 @@ runs:
       shell: bash
       env:
         GH_TOKEN: ${{ inputs.github-token }}
+        _EVENT_NAME: ${{ github.event_name }}
+        _HEAD_REF: ${{ github.head_ref }}
+        _BASE_BRANCH: ${{ inputs.base-branch }}
       run: |
         cd "$GITHUB_WORKSPACE"
         git config user.name  "soundcheck[bot]"
@@ -157,8 +181,8 @@ runs:
         # those paths so pushes don't get rejected when autofix touches them.
         STAGE_SPEC=(-- . ':!.github/workflows')
 
-        if [ "${{ github.event_name }}" = "pull_request" ]; then
-          BRANCH="${{ github.head_ref }}"
+        if [ "$_EVENT_NAME" = "pull_request" ]; then
+          BRANCH="$_HEAD_REF"
           git add -A "${STAGE_SPEC[@]}"
           if git diff --cached --quiet; then
             echo "Only workflow-file rewrites; nothing the default token can push."
@@ -169,7 +193,7 @@ runs:
           git push origin "HEAD:$BRANCH"
         else
           BRANCH="soundcheck/security-review"
-          BASE="${{ inputs.base-branch }}"
+          BASE="$_BASE_BRANCH"
           # Stash rewrites, reset to a clean copy of the base, then replay.
           git stash push --include-untracked
           git fetch --no-tags origin "$BASE"
@@ -178,6 +202,15 @@ runs:
             git checkout -B "$BRANCH" "origin/$BASE"
           else
             git checkout -b "$BRANCH" "origin/$BASE"
+          fi
+          # Drop stash if it touches .github/ paths to prevent LLM-authored
+          # workflow injection from being replayed onto the branch.
+          STASH_FILES=$(git stash show --name-only 2>/dev/null || true)
+          if echo "$STASH_FILES" | grep -qE '(^|/)\.github/'; then
+            echo "::warning::LLM edits include .github/ paths; dropping stash for safety."
+            git stash drop
+            echo "has-changes=false" >> "$GITHUB_OUTPUT"
+            exit 0
           fi
           git stash pop
           git add -A "${STAGE_SPEC[@]}"
@@ -197,70 +230,78 @@ runs:
       shell: bash
       env:
         GH_TOKEN: ${{ inputs.github-token }}
+        _EVENT_NAME: ${{ github.event_name }}
+        _PR_NUMBER: ${{ github.event.pull_request.number }}
+        _REPO: ${{ github.repository }}
+        _PUSH_BRANCH: ${{ steps.push.outputs.branch }}
+        _BASE_BRANCH: ${{ inputs.base-branch }}
       run: |
-        BODY_FILE=/tmp/soundcheck-summary.md
-        if [ ! -f "$BODY_FILE" ]; then
+        RAW_SUMMARY=/tmp/soundcheck-summary.md
+        if [ ! -f "$RAW_SUMMARY" ]; then
           echo "No summary file generated; skipping PR/comment."
           exit 0
         fi
+        # Truncate LLM-generated markdown to 65 kB before posting to prevent
+        # oversized comments and limit the reach of attacker-influenced content.
+        BODY_FILE=/tmp/soundcheck-summary-safe.md
+        head -c 65536 "$RAW_SUMMARY" > "$BODY_FILE"
 
-        if [ "${{ github.event_name }}" = "pull_request" ]; then
-          PR_NUMBER="${{ github.event.pull_request.number }}"
+        if [ "$_EVENT_NAME" = "pull_request" ]; then
+          PR_NUMBER="$_PR_NUMBER"
           gh pr comment "$PR_NUMBER" --body-file "$BODY_FILE" \
-            --repo "${{ github.repository }}"
+            --repo "$_REPO"
           PR_URL=$(gh pr view "$PR_NUMBER" --json url --jq '.url' \
-            --repo "${{ github.repository }}")
+            --repo "$_REPO")
           echo "pr-url=$PR_URL" >> "$GITHUB_OUTPUT"
-        elif [ -n "${{ steps.push.outputs.branch }}" ]; then
+        elif [ -n "$_PUSH_BRANCH" ]; then
           # Only open a PR if the push step actually committed + pushed a
           # branch. The `changes` step's has-changes can be true even when
           # only workflow files were rewritten (which the default token
           # cannot push), in which case push.outputs.branch is empty.
-          BRANCH="${{ steps.push.outputs.branch }}"
-          BASE="${{ inputs.base-branch }}"
+          BRANCH="$_PUSH_BRANCH"
+          BASE="$_BASE_BRANCH"
           TITLE="Soundcheck: security review findings"
           EXISTING=$(gh pr list \
             --head "$BRANCH" --base "$BASE" --state open \
             --json number --jq '.[0].number' \
-            --repo "${{ github.repository }}" 2>/dev/null || echo "")
+            --repo "$_REPO" 2>/dev/null || echo "")
           if [ -n "$EXISTING" ]; then
             gh pr edit "$EXISTING" --body-file "$BODY_FILE" \
-              --repo "${{ github.repository }}"
+              --repo "$_REPO"
             PR_URL=$(gh pr view "$EXISTING" --json url --jq '.url' \
-              --repo "${{ github.repository }}")
+              --repo "$_REPO")
           else
             PR_URL=$(gh pr create \
               --title "$TITLE" --body-file "$BODY_FILE" \
               --head "$BRANCH" --base "$BASE" \
-              --repo "${{ github.repository }}" \
+              --repo "$_REPO" \
               --label security 2>/dev/null || \
             gh pr create \
               --title "$TITLE" --body-file "$BODY_FILE" \
               --head "$BRANCH" --base "$BASE" \
-              --repo "${{ github.repository }}")
+              --repo "$_REPO")
           fi
-          # Queue auto-merge so the PR lands the moment required checks pass.
-          # Non-fatal if the repo hasn't enabled auto-merge or required checks
-          # are still configuring — the PR just stays open for manual review.
-          gh pr merge "$PR_URL" --auto --merge \
-            --repo "${{ github.repository }}" 2>/dev/null || \
-            echo "Auto-merge not enabled on repo; PR stays open."
+          # Auto-merge intentionally omitted: LLM-authored security fixes
+          # require human review before merging to the default branch.
           echo "pr-url=$PR_URL" >> "$GITHUB_OUTPUT"
         fi
 
     - name: Write job summary
       if: always()
       shell: bash
+      env:
+        _PR_URL: ${{ steps.post.outputs.pr-url }}
       run: |
         if [ -f /tmp/soundcheck-summary.md ]; then
-          cat /tmp/soundcheck-summary.md >> "$GITHUB_STEP_SUMMARY"
+          # Cap at 65 kB to prevent oversized job summaries from LLM output.
+          head -c 65536 /tmp/soundcheck-summary.md >> "$GITHUB_STEP_SUMMARY"
         else
           echo "No summary generated." >> "$GITHUB_STEP_SUMMARY"
         fi
-        if [ -n "${{ steps.post.outputs.pr-url }}" ]; then
+        if [ -n "$_PR_URL" ]; then
           {
             echo
-            echo "**PR:** ${{ steps.post.outputs.pr-url }}"
+            echo "**PR:** $_PR_URL"
           } >> "$GITHUB_STEP_SUMMARY"
         fi
 
