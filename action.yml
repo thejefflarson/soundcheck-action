@@ -70,7 +70,7 @@ runs:
       run: |
         # Pin to a specific commit SHA to prevent supply-chain substitution.
         # Update this SHA when intentionally pulling in new soundcheck changes.
-        SOUNDCHECK_SHA="29006167de36a4d9fccca2619592c96d5dc1813c"
+        SOUNDCHECK_SHA="947fb3c3d69639154b0c51a105f9640f126bb65d"
         git clone --filter=blob:none https://github.com/thejefflarson/soundcheck /tmp/soundcheck
         git -C /tmp/soundcheck checkout "$SOUNDCHECK_SHA"
 
