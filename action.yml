@@ -63,7 +63,7 @@ runs:
 
     - name: Install claude CLI
       shell: bash
-      run: npm install -g --ignore-scripts '@anthropic-ai/claude-code@2.1.108'
+      run: npm install -g --ignore-scripts --registry=https://registry.npmjs.org '@anthropic-ai/claude-code@2.1.108'
 
     - name: Check out soundcheck at pinned SHA
       shell: bash
@@ -71,7 +71,7 @@ runs:
         # Pin to a specific commit SHA to prevent supply-chain substitution.
         # Update this SHA when intentionally pulling in new soundcheck changes.
         SOUNDCHECK_SHA="30c2af982350867a70b4222c507e518a7285c4b5"
-        git clone --filter=blob:none https://github.com/thejefflarson/soundcheck /tmp/soundcheck
+        timeout 60 git clone --filter=blob:none https://github.com/thejefflarson/soundcheck /tmp/soundcheck
         git -C /tmp/soundcheck checkout "$SOUNDCHECK_SHA"
 
     - name: Run security review
@@ -91,6 +91,10 @@ runs:
 
         EVENT="$_EVENT_NAME"
         BASE="$_BASE_BRANCH"
+        # Validate base branch name to prevent git flag injection and shell injection.
+        if [[ -z "$BASE" ]] || [[ "$BASE" == --* ]] || [[ "$BASE" =~ [[:space:]] ]] || [[ "$BASE" =~ $'\n' ]] || [[ "$BASE" =~ $'\r' ]]; then
+          echo "::error::Invalid base-branch value"; exit 2
+        fi
 
         # Validate model against an allowlist to prevent argument injection.
         case "$_MODEL" in
@@ -99,6 +103,20 @@ runs:
             ;;
           *) echo "::error::Invalid model identifier: $_MODEL"; exit 2 ;;
         esac
+
+        # Validate budget and timeout inputs to prevent disabling cost controls.
+        if ! [[ "$_MAX_BUDGET" =~ ^[0-9]+(\.[0-9]+)?$ ]] || [ "$(echo "$_MAX_BUDGET <= 0" | bc -l)" = "1" ]; then
+          echo "::error::Invalid max-budget-usd: must be a positive number"; exit 2
+        fi
+        if ! [[ "$_TIMEOUT" =~ ^[0-9]+$ ]] || [ "$_TIMEOUT" -le 0 ] || [ "$_TIMEOUT" -gt 3600 ]; then
+          echo "::error::Invalid timeout-seconds: must be an integer in 1-3600"; exit 2
+        fi
+
+        # Remove per-repo LLM instruction files to prevent attacker-controlled
+        # prompts from hijacking the reviewer (OWASP LLM01 prompt injection).
+        find "$GITHUB_WORKSPACE" -name 'CLAUDE.md' -not -path '*/.git/*' -delete 2>/dev/null || true
+        find "$GITHUB_WORKSPACE" -name '.claude' -type d -not -path '*/.git/*' \
+          -exec rm -rf {} + 2>/dev/null || true
 
         # Assemble the CLI args. PRs get a diff-scoped review against the
         # base branch; schedule/workflow_dispatch runs do a full-repo scan.
