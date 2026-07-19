@@ -63,7 +63,7 @@ runs:
 
     - name: Install claude CLI
       shell: bash
-      run: npm install -g --ignore-scripts '@anthropic-ai/claude-code@2.1.108'
+      run: npm install -g --ignore-scripts '@anthropic-ai/claude-code@2.1.214'
 
     - name: Check out soundcheck at pinned SHA
       shell: bash
