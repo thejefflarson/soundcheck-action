@@ -63,7 +63,12 @@ runs:
 
     - name: Install claude CLI
       shell: bash
-      run: npm install -g --ignore-scripts '@anthropic-ai/claude-code@2.1.214'
+      run: |
+        npm install -g --ignore-scripts '@anthropic-ai/claude-code@2.1.214'
+        # Audit for high-severity vulnerabilities in the installed package.
+        # A compromised registry entry would likely introduce new advisories.
+        npm audit --audit-level=high 2>/dev/null \
+          || echo "::warning::npm audit flagged issues in @anthropic-ai/claude-code; review before proceeding"
 
     - name: Check out soundcheck at pinned SHA
       shell: bash
@@ -73,6 +78,23 @@ runs:
         SOUNDCHECK_SHA="4fc07c9516e2c64766dfdc47ae1508d9d7a5905d"
         git clone --filter=blob:none https://github.com/thejefflarson/soundcheck /tmp/soundcheck
         git -C /tmp/soundcheck checkout "$SOUNDCHECK_SHA"
+        # Verify the critical Python script's digest after checkout to detect
+        # post-checkout tampering or a malicious commit at the pinned SHA.
+        # Compute once, then set EXPECTED_SCRIPT_SHA and remove the TODO guard.
+        SCRIPT_PATH="/tmp/soundcheck/scripts/security-review-action.py"
+        if [ ! -f "$SCRIPT_PATH" ]; then
+          echo "::error::Security review script missing after checkout"
+          exit 2
+        fi
+        ACTUAL_SCRIPT_SHA=$(sha256sum "$SCRIPT_PATH" | cut -d' ' -f1)
+        # TODO: pin this hash and replace the string below after first run.
+        EXPECTED_SCRIPT_SHA="PLACEHOLDER_PIN_AFTER_FIRST_RUN"
+        if [ "$EXPECTED_SCRIPT_SHA" != "PLACEHOLDER_PIN_AFTER_FIRST_RUN" ] && \
+           [ "$ACTUAL_SCRIPT_SHA" != "$EXPECTED_SCRIPT_SHA" ]; then
+          echo "::error::Script digest mismatch — expected $EXPECTED_SCRIPT_SHA got $ACTUAL_SCRIPT_SHA"
+          exit 2
+        fi
+        echo "::notice::soundcheck script SHA-256=$ACTUAL_SCRIPT_SHA (set as EXPECTED_SCRIPT_SHA to enable enforcement)"
 
     - name: Run security review
       id: review
@@ -88,9 +110,17 @@ runs:
         _BEFORE: ${{ github.event.before }}
       run: |
         set +e
+        # Mask the API key immediately to prevent accidental log exposure,
+        # including via prompt-injection payloads that echo env vars.
+        echo "::add-mask::$ANTHROPIC_API_KEY"
 
         EVENT="$_EVENT_NAME"
         BASE="$_BASE_BRANCH"
+        # Validate BASE branch name to prevent git option injection (values
+        # beginning with '-' would be interpreted as git option flags).
+        if [[ "$BASE" == -* ]]; then
+          echo "::error::Invalid base-branch: must not begin with a dash"; exit 2
+        fi
 
         # Validate model against an allowlist to prevent argument injection.
         case "$_MODEL" in
@@ -99,6 +129,15 @@ runs:
             ;;
           *) echo "::error::Invalid model identifier: $_MODEL"; exit 2 ;;
         esac
+
+        # Validate numeric inputs to prevent argument injection via non-numeric
+        # strings reaching the Python argument parser.
+        if ! [[ "$_MAX_BUDGET" =~ ^[0-9]+(\.[0-9]+)?$ ]]; then
+          echo "::error::Invalid max-budget-usd: '$_MAX_BUDGET' (must be a positive number)"; exit 2
+        fi
+        if ! [[ "$_TIMEOUT" =~ ^[0-9]+$ ]]; then
+          echo "::error::Invalid timeout-seconds: '$_TIMEOUT' (must be a positive integer)"; exit 2
+        fi
 
         # Assemble the CLI args. PRs get a diff-scoped review against the
         # base branch; schedule/workflow_dispatch runs do a full-repo scan.
@@ -179,11 +218,27 @@ runs:
 
         # GITHUB_TOKEN is not allowed to modify .github/workflows/*; exclude
         # those paths so pushes don't get rejected when autofix touches them.
-        STAGE_SPEC=(-- . ':!.github/workflows')
+        # Exclude all of .github/ (not just workflows) so LLM-authored rewrites
+        # cannot touch CODEOWNERS, dependabot.yml, actions/, or other sensitive
+        # GitHub configuration even if the autofix pass attempts to edit them.
+        STAGE_SPEC=(-- . ':!.github/')
 
         if [ "$_EVENT_NAME" = "pull_request" ]; then
+          # Validate HEAD_REF to prevent git push ref injection. Fork PRs can
+          # set github.head_ref to arbitrary values; a leading '-' or special
+          # chars could redirect the push or inject options.
+          if ! [[ "$_HEAD_REF" =~ ^[a-zA-Z0-9._/:-]+$ ]] || [[ "$_HEAD_REF" == -* ]]; then
+            echo "::error::Invalid head_ref: '$_HEAD_REF' — must contain only alphanumeric, dot, slash, colon, or hyphen characters and must not begin with a dash"; exit 2
+          fi
           BRANCH="$_HEAD_REF"
           git add -A "${STAGE_SPEC[@]}"
+          # Belt-and-suspenders guard: abort if any staged file is under .github/
+          # even though STAGE_SPEC already excludes it (covers git add edge cases).
+          STAGED_DOTGITHUB=$(git diff --cached --name-only | grep -E '(^|\/)\.github\/' || true)
+          if [ -n "$STAGED_DOTGITHUB" ]; then
+            echo "::warning::LLM edits include .github/ paths; dropping those changes for safety."
+            git reset HEAD -- '.github/'
+          fi
           if git diff --cached --quiet; then
             echo "Only workflow-file rewrites; nothing the default token can push."
             echo "has-changes=false" >> "$GITHUB_OUTPUT"
@@ -241,17 +296,21 @@ runs:
           echo "No summary file generated; skipping PR/comment."
           exit 0
         fi
-        # Truncate LLM-generated markdown to 65 kB before posting to prevent
-        # oversized comments and limit the reach of attacker-influenced content.
+        # Truncate LLM-generated markdown to 65 kB and strip GitHub Actions
+        # workflow-command sequences (::set-env::, ::add-mask::, etc.) to prevent
+        # prompt-injected content from manipulating the runner environment when
+        # the comment is consumed by downstream tools.
         BODY_FILE=/tmp/soundcheck-summary-safe.md
-        head -c 65536 "$RAW_SUMMARY" > "$BODY_FILE"
+        head -c 65536 "$RAW_SUMMARY" | \
+          python3 -c "import re,sys; sys.stdout.write(re.sub(r'::[a-z][a-z-]*(?:\s[^:]*)?::[^\n]*','[redacted-workflow-cmd]',sys.stdin.read()))" \
+          > "$BODY_FILE"
 
         if [ "$_EVENT_NAME" = "pull_request" ]; then
           PR_NUMBER="$_PR_NUMBER"
           gh pr comment "$PR_NUMBER" --body-file "$BODY_FILE" \
             --repo "$_REPO"
           PR_URL=$(gh pr view "$PR_NUMBER" --json url --jq '.url' \
-            --repo "$_REPO")
+            --repo "$_REPO" | tr -d '\r\n')
           echo "pr-url=$PR_URL" >> "$GITHUB_OUTPUT"
         elif [ -n "$_PUSH_BRANCH" ]; then
           # Only open a PR if the push step actually committed + pushed a
@@ -269,7 +328,7 @@ runs:
             gh pr edit "$EXISTING" --body-file "$BODY_FILE" \
               --repo "$_REPO"
             PR_URL=$(gh pr view "$EXISTING" --json url --jq '.url' \
-              --repo "$_REPO")
+              --repo "$_REPO" | tr -d '\r\n')
           else
             PR_URL=$(gh pr create \
               --title "$TITLE" --body-file "$BODY_FILE" \
@@ -280,6 +339,7 @@ runs:
               --title "$TITLE" --body-file "$BODY_FILE" \
               --head "$BRANCH" --base "$BASE" \
               --repo "$_REPO")
+            PR_URL=$(printf '%s' "$PR_URL" | tr -d '\r\n')
           fi
           # Auto-merge intentionally omitted: LLM-authored security fixes
           # require human review before merging to the default branch.
@@ -293,8 +353,12 @@ runs:
         _PR_URL: ${{ steps.post.outputs.pr-url }}
       run: |
         if [ -f /tmp/soundcheck-summary.md ]; then
-          # Cap at 65 kB to prevent oversized job summaries from LLM output.
-          head -c 65536 /tmp/soundcheck-summary.md >> "$GITHUB_STEP_SUMMARY"
+          # Cap at 65 kB and strip workflow-command sequences before appending
+          # to GITHUB_STEP_SUMMARY. Injected ::set-env:: / ::add-mask:: etc.
+          # sequences can manipulate the runner environment if not removed.
+          head -c 65536 /tmp/soundcheck-summary.md | \
+            python3 -c "import re,sys; sys.stdout.write(re.sub(r'::[a-z][a-z-]*(?:\s[^:]*)?::[^\n]*','[redacted-workflow-cmd]',sys.stdin.read()))" \
+            >> "$GITHUB_STEP_SUMMARY"
         else
           echo "No summary generated." >> "$GITHUB_STEP_SUMMARY"
         fi
