@@ -231,6 +231,15 @@ runs:
             echo "::error::Invalid head_ref: '$_HEAD_REF' — must contain only alphanumeric, dot, slash, colon, or hyphen characters and must not begin with a dash"; exit 2
           fi
           BRANCH="$_HEAD_REF"
+          # The workflow checks out the PR *merge* ref (refs/pull/N/merge), which
+          # is detached and usually shallow, so the branch head is not a reachable
+          # ancestor here — committing the rewrites and pushing HEAD:$BRANCH is
+          # rejected as a non-fast-forward. Stash the rewrites, switch to the real
+          # branch head, and replay them so the push fast-forwards cleanly.
+          git stash push --include-untracked
+          git fetch --no-tags --depth=1 origin "$BRANCH"
+          git checkout -B "$BRANCH" FETCH_HEAD
+          git stash pop
           git add -A "${STAGE_SPEC[@]}"
           # Belt-and-suspenders guard: abort if any staged file is under .github/
           # even though STAGE_SPEC already excludes it (covers git add edge cases).
