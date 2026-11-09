@@ -141,9 +141,16 @@ runs:
 
         # Assemble the CLI args. PRs get a diff-scoped review against the
         # base branch; schedule/workflow_dispatch runs do a full-repo scan.
+        #
+        # No --skill-path: the script auto-selects the skill by mode — the
+        # lean pr-review skill for diff-scoped PR/push runs, the heavy
+        # security-review orchestrator for full-repo scans. Both resolve
+        # inside the pinned /tmp/soundcheck checkout (trusted), not the repo
+        # under review, so the self-review-poisoning guard still holds. This
+        # keeps PR runs cheap: a shorter system prompt, and no subagent-
+        # dispatch instructions the single-pass gate cannot act on anyway.
         ARGS=(
           --repo-dir "$GITHUB_WORKSPACE"
-          --skill-path /tmp/soundcheck/.claude/skills/security-review/SKILL.md
           --model "$_MODEL"
           --max-budget-usd "$_MAX_BUDGET"
           --timeout "$_TIMEOUT"
