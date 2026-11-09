@@ -64,7 +64,7 @@ runs:
     - name: Install claude CLI
       shell: bash
       run: |
-        npm install -g --ignore-scripts '@anthropic-ai/claude-code@2.1.214'
+        npm install -g --ignore-scripts '@anthropic-ai/claude-code@2.1.319'
         # Audit for high-severity vulnerabilities in the installed package.
         # A compromised registry entry would likely introduce new advisories.
         npm audit --audit-level=high 2>/dev/null \
