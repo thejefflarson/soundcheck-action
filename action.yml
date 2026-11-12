@@ -123,8 +123,15 @@ runs:
         fi
 
         # Validate model against an allowlist to prevent argument injection.
+        # Current-generation ids are listed exactly (no date suffix — those
+        # ids are complete as-is); the trailing-glob entries are legacy
+        # dated-snapshot families kept for back-compat.
         case "$_MODEL" in
-          sonnet|haiku|opus|claude-opus-4-5|claude-sonnet-4-5|claude-haiku-4-5|\
+          sonnet|haiku|opus|\
+          claude-opus-5-5|claude-opus-5|claude-sonnet-5-5|claude-sonnet-5|claude-haiku-5-5|\
+          claude-fable-5-1|claude-fable-5|\
+          claude-opus-4-8|claude-opus-4-7|claude-opus-4-6|claude-sonnet-4-6|\
+          claude-opus-4-5|claude-sonnet-4-5|claude-haiku-4-5|\
           claude-3-5-sonnet-*|claude-3-5-haiku-*|claude-3-opus-*)
             ;;
           *) echo "::error::Invalid model identifier: $_MODEL"; exit 2 ;;
