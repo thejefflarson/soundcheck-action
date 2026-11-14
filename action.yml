@@ -75,7 +75,7 @@ runs:
       run: |
         # Pin to a specific commit SHA to prevent supply-chain substitution.
         # Update this SHA when intentionally pulling in new soundcheck changes.
-        SOUNDCHECK_SHA="cb372f2e6b11b7723a376487e220c806805048a5"
+        SOUNDCHECK_SHA="40290afd998cf901a4edb1a4c7eadae979a7f646"
         git clone --filter=blob:none https://github.com/thejefflarson/soundcheck /tmp/soundcheck
         git -C /tmp/soundcheck checkout "$SOUNDCHECK_SHA"
         # Verify the critical Python script's digest after checkout to detect
