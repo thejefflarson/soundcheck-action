@@ -59,12 +59,19 @@ runs:
     - name: Set up Node
       uses: actions/setup-node@53b83947a5a98c8d113130e565377fae1a50d02f # v6.3.0
       with:
-        node-version: "20"
+        # Claude Code 2.1.x requires Node 22 or later.
+        node-version: "22"
 
     - name: Install claude CLI
       shell: bash
       run: |
         npm install -g --ignore-scripts '@anthropic-ai/claude-code@2.1.319'
+        # --ignore-scripts keeps every dependency's install hook from running, but the
+        # package's own postinstall is what links the platform binary over the bin/claude.exe
+        # placeholder; without it, running `claude` fails with "Exec format error". Run only
+        # that one script, from the pinned package.
+        (cd "$(npm root -g)/@anthropic-ai/claude-code" && node install.cjs)
+        claude --version
         # Audit for high-severity vulnerabilities in the installed package.
         # A compromised registry entry would likely introduce new advisories.
         npm audit --audit-level=high 2>/dev/null \
